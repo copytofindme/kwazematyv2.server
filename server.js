@@ -10,10 +10,14 @@ app.use((req, res, next) => {
     next();
 });
 
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+admin.initializeApp({
+    credential: admin.credential.cert({
+        projectId: process.env.FIREBASE_PROJECT_ID,
+        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+        privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+    })
+});
 const db = admin.firestore();
-
 const BOT_TOKEN = process.env.BOT_TOKEN;
 
 function verifyTelegram(initData) {
@@ -32,15 +36,12 @@ function verifyTelegram(initData) {
 
 app.post('/spin', async (req, res) => {
     const { initData, winner } = req.body;
-
     if (!initData || !verifyTelegram(initData)) {
         return res.status(401).json({ error: 'Недействительная подпись Telegram' });
     }
-
     const params = new URLSearchParams(initData);
     const user = JSON.parse(params.get('user'));
     const userId = String(user.id);
-
     const userRef = db.collection('users').doc(userId);
     await db.runTransaction(async (t) => {
         const doc = await t.get(userRef);
@@ -52,12 +53,10 @@ app.post('/spin', async (req, res) => {
             firstName: user.first_name || 'Игрок',
             username: user.username || null,
             photoUrl: user.photo_url || null,
-            totalPower,
-            itemCounts,
+            totalPower, itemCounts,
             lastSpin: admin.firestore.FieldValue.serverTimestamp(),
         }, { merge: true });
     });
-
     res.json({ success: true });
 });
 
