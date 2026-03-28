@@ -4,10 +4,19 @@ const admin = require('firebase-admin');
 const rateLimit = require('express-rate-limit');
 
 const app = express();
+
+const REQUIRED_ENV = ['FIREBASE_PROJECT_ID', 'FIREBASE_CLIENT_EMAIL', 'FIREBASE_PRIVATE_KEY', 'BOT_TOKEN'];
+const missing = REQUIRED_ENV.filter(k => !process.env[k]);
+if (missing.length) {
+    console.error('❌ Отсутствуют переменные окружения:', missing.join(', '));
+    process.exit(1);
+}
 app.use(express.json());
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Headers', 'Content-Type');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, x-session-id');
+    res.header('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
 });
 
@@ -86,6 +95,8 @@ function verifyTelegram(initData) {
 
     return JSON.parse(params.get('user'));
 }
+
+app.get('/health', (req, res) => res.json({ ok: true }));
 
 app.post('/spin', async (req, res) => {
     const { initData, caseId, deviceId } = req.body;
