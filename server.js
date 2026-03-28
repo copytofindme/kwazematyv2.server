@@ -74,7 +74,7 @@ function verifyTelegram(initData) {
 
     const authDate = parseInt(params.get('auth_date') || '0');
     const now = Math.floor(Date.now() / 1000);
-    if (now - authDate > 300) return null;
+    if (now - authDate > 86400) return null;
 
     const dataStr = Array.from(params.entries())
         .sort(([a], [b]) => a.localeCompare(b))
@@ -88,7 +88,7 @@ function verifyTelegram(initData) {
 }
 
 app.post('/spin', async (req, res) => {
-    const { initData, caseId } = req.body;
+    const { initData, caseId, deviceId } = req.body;
 
     const user = verifyTelegram(initData);
     if (!user) return res.status(401).json({ error: 'Недействительная подпись' });
@@ -99,9 +99,18 @@ app.post('/spin', async (req, res) => {
     const userId = String(user.id);
     const userRef = db.collection('users').doc(userId);
     const userDoc = await userRef.get();
+
     if (userDoc.exists) {
-        const lastSpin = userDoc.data().lastSpin?.toDate?.();
-        if (lastSpin && (Date.now() - lastSpin.getTime()) < 5000) {
+        const data = userDoc.data();
+        const lastSpin = data.lastSpin?.toDate?.();
+        const timeSinceLastSpin = lastSpin ? (Date.now() - lastSpin.getTime()) : Infinity;
+
+        const savedDevice = data.deviceId;
+        if (savedDevice && savedDevice !== deviceId && timeSinceLastSpin < 5 * 60 * 1000) {
+            return res.status(403).json({ error: 'Рулетка уже открыта на другом устройстве!' });
+        }
+
+        if (timeSinceLastSpin < 5000) {
             return res.status(429).json({ error: 'Слишком быстро!' });
         }
     }
@@ -121,6 +130,8 @@ app.post('/spin', async (req, res) => {
             totalPower,
             itemCounts,
             lastSpin: admin.firestore.FieldValue.serverTimestamp(),
+            deviceId: deviceId || null,
+            deviceIdUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
         }, { merge: true });
     });
 
