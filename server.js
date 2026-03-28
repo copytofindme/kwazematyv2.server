@@ -11,11 +11,7 @@ app.use((req, res, next) => {
     next();
 });
 
-const limiter = rateLimit({
-    windowMs: 60 * 1000,
-    max: 20,
-    message: { error: 'Слишком много запросов' }
-});
+const limiter = rateLimit({ windowMs: 60 * 1000, max: 20, message: { error: 'Слишком много запросов' } });
 app.use(limiter);
 
 admin.initializeApp({
@@ -28,29 +24,47 @@ admin.initializeApp({
 const db = admin.firestore();
 const BOT_TOKEN = process.env.BOT_TOKEN;
 
-const VALID_ITEMS = {
-    "Amour plastique":  1,
-    "Я НЕ ПЕРДЕЛ":     3,
-    "Еврейское логово": 6,
-    "ПАРНУХА":          15,
-    "TURKISH KILLER":   30,
-    "Иисус":            100,
-    "АХнежка":          500,
-    "Персонаж 2-1":     1,
-    "Персонаж 2-2":     3,
-    "Персонаж 2-3":     6,
-    "Персонаж 2-4":     15,
-    "Персонаж 2-5":     30,
-    "Персонаж 2-6":     100,
-    "Секрет 2":         500,
-    "Персонаж 3-1":     1,
-    "Персонаж 3-2":     3,
-    "Персонаж 3-3":     6,
-    "Персонаж 3-4":     15,
-    "Персонаж 3-5":     30,
-    "Персонаж 3-6":     100,
-    "Секрет 3":         500,
+const CASES = {
+    1: [
+        { name: "Amour plastique",  power: 1,   chance: 35  },
+        { name: "Я НЕ ПЕРДЕЛ",     power: 3,   chance: 25  },
+        { name: "Еврейское логово", power: 6,   chance: 20  },
+        { name: "ПАРНУХА",          power: 15,  chance: 10  },
+        { name: "TURKISH KILLER",   power: 30,  chance: 7   },
+        { name: "Иисус",            power: 100, chance: 2.5 },
+        { name: "АХнежка",          power: 500, chance: 0.5 },
+    ],
+    2: [
+        { name: "Персонаж 2-1", power: 1,   chance: 35  },
+        { name: "Персонаж 2-2", power: 3,   chance: 25  },
+        { name: "Персонаж 2-3", power: 6,   chance: 20  },
+        { name: "Персонаж 2-4", power: 15,  chance: 10  },
+        { name: "Персонаж 2-5", power: 30,  chance: 7   },
+        { name: "Персонаж 2-6", power: 100, chance: 2.5 },
+        { name: "Секрет 2",     power: 500, chance: 0.5 },
+    ],
+    3: [
+        { name: "Персонаж 3-1", power: 1,   chance: 35  },
+        { name: "Персонаж 3-2", power: 3,   chance: 25  },
+        { name: "Персонаж 3-3", power: 6,   chance: 20  },
+        { name: "Персонаж 3-4", power: 15,  chance: 10  },
+        { name: "Персонаж 3-5", power: 30,  chance: 7   },
+        { name: "Персонаж 3-6", power: 100, chance: 2.5 },
+        { name: "Секрет 3",     power: 500, chance: 0.5 },
+    ]
 };
+
+function pickWinner(caseId) {
+    const items = CASES[caseId];
+    if (!items) return null;
+    const total = items.reduce((s, i) => s + i.chance, 0);
+    let rnd = Math.random() * total;
+    for (const item of items) {
+        rnd -= item.chance;
+        if (rnd <= 0) return item;
+    }
+    return items[items.length - 1];
+}
 
 function verifyTelegram(initData) {
     const params = new URLSearchParams(initData);
@@ -61,6 +75,7 @@ function verifyTelegram(initData) {
     const authDate = parseInt(params.get('auth_date') || '0');
     const now = Math.floor(Date.now() / 1000);
     if (now - authDate > 300) return null;
+
     const dataStr = Array.from(params.entries())
         .sort(([a], [b]) => a.localeCompare(b))
         .map(([k, v]) => `${k}=${v}`)
@@ -73,37 +88,32 @@ function verifyTelegram(initData) {
 }
 
 app.post('/spin', async (req, res) => {
-    const { initData, winner } = req.body;
+    const { initData, caseId } = req.body;
 
     const user = verifyTelegram(initData);
-    if (!user) {
-        return res.status(401).json({ error: 'Недействительная или устаревшая подпись Telegram' });
-    }
+    if (!user) return res.status(401).json({ error: 'Недействительная подпись' });
 
-    const realPower = VALID_ITEMS[winner.name];
-    if (realPower === undefined) {
-        return res.status(400).json({ error: 'Неизвестный предмет' });
-    }
-
-    const queryId = new URLSearchParams(initData).get('query_id');
-    if (queryId) {
-        const replayRef = db.collection('used_tokens').doc(queryId);
-        const existing = await replayRef.get();
-        if (existing.exists) {
-            return res.status(429).json({ error: 'Токен уже использован' });
-        }
-        // Сохраняем токен на 10 минут
-        await replayRef.set({ usedAt: admin.firestore.FieldValue.serverTimestamp() });
-    }
+    const caseNum = parseInt(caseId) || 1;
+    if (!CASES[caseNum]) return res.status(400).json({ error: 'Неизвестный кейс' });
 
     const userId = String(user.id);
     const userRef = db.collection('users').doc(userId);
+    const userDoc = await userRef.get();
+    if (userDoc.exists) {
+        const lastSpin = userDoc.data().lastSpin?.toDate?.();
+        if (lastSpin && (Date.now() - lastSpin.getTime()) < 5000) {
+            return res.status(429).json({ error: 'Слишком быстро!' });
+        }
+    }
+
+    const winner = pickWinner(caseNum);
+
     await db.runTransaction(async (t) => {
         const doc = await t.get(userRef);
         const existing = doc.exists ? doc.data() : {};
         const itemCounts = existing.itemCounts || {};
         itemCounts[winner.name] = (itemCounts[winner.name] || 0) + 1;
-        const totalPower = (existing.totalPower || 0) + realPower; // мощь с сервера!
+        const totalPower = (existing.totalPower || 0) + winner.power;
         t.set(userRef, {
             firstName: user.first_name || 'Игрок',
             username: user.username || null,
@@ -114,7 +124,7 @@ app.post('/spin', async (req, res) => {
         }, { merge: true });
     });
 
-    res.json({ success: true });
+    res.json({ winner: winner.name, power: winner.power });
 });
 
 app.listen(process.env.PORT || 3000, () => console.log('Server running'));
