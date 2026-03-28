@@ -1,9 +1,16 @@
 const express = require('express');
+const rateLimit = require('express-rate-limit');
 const crypto = require('crypto');
 const admin = require('firebase-admin');
 
 const app = express();
 app.use(express.json());
+const limiter = rateLimit({
+    windowMs: 60 * 1000,  
+    max: 30,             
+    message: { error: 'Слишком много запросов' }
+});
+app.use(limiter);
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Headers', 'Content-Type');
