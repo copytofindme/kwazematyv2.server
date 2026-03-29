@@ -7,7 +7,9 @@ const app = express();
 app.use(express.json());
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Headers', 'Content-Type');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, x-session-id');
+    if (req.method === 'OPTIONS') return res.sendStatus(200);
     next();
 });
 
@@ -160,7 +162,6 @@ app.post('/spin', async (req, res) => {
         const idx = spins.findIndex(s => s.caseId === caseNum && !s.used);
         if (idx !== -1) {
             winner = { name: spins[idx].winner, power: spins[idx].power };
-            // Помечаем как использованный
             spins[idx].used = true;
             await pendingRef.update({ spins });
         }
