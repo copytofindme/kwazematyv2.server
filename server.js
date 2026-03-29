@@ -11,6 +11,7 @@ app.use((req, res, next) => {
     next();
 });
 
+app.set('trust proxy', 1);
 const limiter = rateLimit({ windowMs: 60 * 1000, max: 60, message: { error: 'Слишком много запросов' } });
 app.use(limiter);
 
