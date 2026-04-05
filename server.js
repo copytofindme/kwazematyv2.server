@@ -63,9 +63,14 @@ const CASES = {
 
 const BATCH_SIZE = 10;
 const COMMIT_DELAY_MS = 7300;
-const SPIN_EXPIRY_MS = 30 * 60 * 1000; 
+const SPIN_EXPIRY_MS = 30 * 60 * 1000;
 
 const commitLock = new Set();
+const lastCommitDone = new Map();
+const lastBatchRequest = new Map();
+const MIN_BETWEEN_COMMITS_MS = 8500;
+const MIN_BETWEEN_BATCHES_MS = 20000;
+const MIN_SPIN_AGE_MS = 1000;
 
 function pickWinner(caseId) {
     const items = CASES[caseId];
@@ -110,12 +115,19 @@ app.post('/batch', async (req, res) => {
     const pendingRef = db.collection('pending_spins').doc(userId);
     const now = Date.now();
 
+    const lastBatch = lastBatchRequest.get(userId) || 0;
+    if (now - lastBatch < MIN_BETWEEN_BATCHES_MS) {
+        const doc = await pendingRef.get();
+        const existing = (doc.exists ? doc.data().spins || [] : [])
+            .filter(s => s.caseId === caseNum && !s.used && !s.committed && (now - s.createdAt) < SPIN_EXPIRY_MS);
+        return res.json({ ok: true, spins: existing.map(s => ({ id: s.id, winner: s.winner, power: s.power })) });
+    }
+    lastBatchRequest.set(userId, now);
+
     const doc = await pendingRef.get();
-    // Оставляем только живые неиспользованные спины этого кейса
     const existing = (doc.exists ? doc.data().spins || [] : [])
         .filter(s => s.caseId === caseNum && !s.used && !s.committed && (now - s.createdAt) < SPIN_EXPIRY_MS);
 
-    // Добиваем до BATCH_SIZE
     const toAdd = Math.max(0, BATCH_SIZE - existing.length);
     const newSpins = [];
     for (let i = 0; i < toAdd; i++) {
@@ -140,6 +152,7 @@ app.post('/batch', async (req, res) => {
     });
 });
 
+
 app.post('/commit', async (req, res) => {
     const { initData, spinId, deviceId } = req.body;
 
@@ -152,6 +165,13 @@ app.post('/commit', async (req, res) => {
         return res.json({ ok: true, skipped: true });
     }
 
+    const lastDone = lastCommitDone.get(userId) || 0;
+    const sinceLastCommit = Date.now() - lastDone;
+    if (sinceLastCommit < MIN_BETWEEN_COMMITS_MS) {
+        const waitMs = MIN_BETWEEN_COMMITS_MS - sinceLastCommit;
+        return res.status(429).json({ error: `Слишком быстро. Подожди ${Math.ceil(waitMs / 1000)} сек.` });
+    }
+
     const pendingRef = db.collection('pending_spins').doc(userId);
     const pendingDoc = await pendingRef.get();
     if (!pendingDoc.exists) return res.status(400).json({ error: 'Нет заготовленных спинов' });
@@ -161,6 +181,10 @@ app.post('/commit', async (req, res) => {
     if (spinIdx === -1) return res.status(400).json({ error: 'Спин не найден или уже использован' });
 
     const spin = spins[spinIdx];
+
+    if (Date.now() - spin.createdAt < MIN_SPIN_AGE_MS) {
+        return res.status(400).json({ error: 'Спин слишком свежий' });
+    }
 
     spins[spinIdx] = { ...spin, committed: true };
     await pendingRef.update({ spins });
@@ -197,6 +221,7 @@ app.post('/commit', async (req, res) => {
             }
 
             console.log(`✅ committed user=${userId} winner=${spin.winner} power=${spin.power}`);
+            lastCommitDone.set(userId, Date.now());
         } catch (e) {
             console.error('❌ commit error:', e);
         } finally {
