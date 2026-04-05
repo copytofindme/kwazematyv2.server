@@ -14,8 +14,12 @@ app.use((req, res, next) => {
 });
 
 app.set('trust proxy', 1);
-const limiter = rateLimit({ windowMs: 60 * 1000, max: 60, message: { error: 'Слишком много запросов' } });
+const limiter = rateLimit({ windowMs: 60 * 1000, max: 120, message: { error: 'Слишком много запросов' } });
 app.use(limiter);
+
+const REQUIRED_ENV = ['FIREBASE_PROJECT_ID', 'FIREBASE_CLIENT_EMAIL', 'FIREBASE_PRIVATE_KEY', 'BOT_TOKEN'];
+const missing = REQUIRED_ENV.filter(k => !process.env[k]);
+if (missing.length) { console.error('❌ Отсутствуют переменные:', missing.join(', ')); process.exit(1); }
 
 admin.initializeApp({
     credential: admin.credential.cert({
@@ -57,38 +61,44 @@ const CASES = {
     ]
 };
 
+const BATCH_SIZE = 10;
+const COMMIT_DELAY_MS = 7300;
+const SPIN_EXPIRY_MS = 30 * 60 * 1000; 
+
+const commitLock = new Set();
+
 function pickWinner(caseId) {
     const items = CASES[caseId];
     if (!items) return null;
     const total = items.reduce((s, i) => s + i.chance, 0);
     let rnd = Math.random() * total;
-    for (const item of items) {
-        rnd -= item.chance;
-        if (rnd <= 0) return item;
-    }
+    for (const item of items) { rnd -= item.chance; if (rnd <= 0) return item; }
     return items[items.length - 1];
 }
 
 function verifyTelegram(initData) {
-    const params = new URLSearchParams(initData);
-    const hash = params.get('hash');
-    if (!hash) return null;
-    params.delete('hash');
-    const authDate = parseInt(params.get('auth_date') || '0');
-    const now = Math.floor(Date.now() / 1000);
-    if (now - authDate > 86400) return null;
-    const dataStr = Array.from(params.entries())
-        .sort(([a], [b]) => a.localeCompare(b))
-        .map(([k, v]) => `${k}=${v}`)
-        .join('\n');
-    const secretKey = crypto.createHmac('sha256', 'WebAppData').update(BOT_TOKEN).digest();
-    const expectedHash = crypto.createHmac('sha256', secretKey).update(dataStr).digest('hex');
-    if (expectedHash !== hash) return null;
-    return JSON.parse(params.get('user'));
+    try {
+        const params = new URLSearchParams(initData);
+        const hash = params.get('hash');
+        if (!hash) return null;
+        params.delete('hash');
+        const authDate = parseInt(params.get('auth_date') || '0');
+        if (Math.floor(Date.now() / 1000) - authDate > 86400) return null;
+        const dataStr = Array.from(params.entries())
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([k, v]) => `${k}=${v}`).join('\n');
+        const secret = crypto.createHmac('sha256', 'WebAppData').update(BOT_TOKEN).digest();
+        const expected = crypto.createHmac('sha256', secret).update(dataStr).digest('hex');
+        if (expected !== hash) return null;
+        return JSON.parse(params.get('user'));
+    } catch { return null; }
 }
 
-app.post('/prefetch', async (req, res) => {
-    const { initData, caseId, deviceId } = req.body;
+app.get('/health', (req, res) => res.json({ ok: true }));
+
+
+app.post('/batch', async (req, res) => {
+    const { initData, caseId } = req.body;
 
     const user = verifyTelegram(initData);
     if (!user) return res.status(401).json({ error: 'Недействительная подпись' });
@@ -98,97 +108,101 @@ app.post('/prefetch', async (req, res) => {
 
     const userId = String(user.id);
     const pendingRef = db.collection('pending_spins').doc(userId);
-    const pendingDoc = await pendingRef.get();
+    const now = Date.now();
 
-    const existing = pendingDoc.exists ? (pendingDoc.data().spins || []) : [];
-    const forThisCase = existing.filter(s => s.caseId === caseNum && !s.used);
+    const doc = await pendingRef.get();
+    // Оставляем только живые неиспользованные спины этого кейса
+    const existing = (doc.exists ? doc.data().spins || [] : [])
+        .filter(s => s.caseId === caseNum && !s.used && !s.committed && (now - s.createdAt) < SPIN_EXPIRY_MS);
 
-    const toAdd = 2 - forThisCase.length;
-    if (toAdd <= 0) return res.json({ ok: true, prepared: 0 });
-
+    // Добиваем до BATCH_SIZE
+    const toAdd = Math.max(0, BATCH_SIZE - existing.length);
     const newSpins = [];
     for (let i = 0; i < toAdd; i++) {
-        const winner = pickWinner(caseNum);
+        const w = pickWinner(caseNum);
         newSpins.push({
             id: crypto.randomUUID(),
             caseId: caseNum,
-            winner: winner.name,
-            power: winner.power,
+            winner: w.name,
+            power: w.power,
             used: false,
-            createdAt: Date.now(),
+            committed: false,
+            createdAt: now,
         });
     }
 
-    await pendingRef.set({
-        spins: [...existing, ...newSpins],
-        deviceId: deviceId || null,
-    }, { merge: true });
+    const allSpins = [...existing, ...newSpins];
+    await pendingRef.set({ spins: allSpins, updatedAt: now });
 
-    res.json({ ok: true, prepared: toAdd });
+    res.json({
+        ok: true,
+        spins: allSpins.map(s => ({ id: s.id, winner: s.winner, power: s.power }))
+    });
 });
 
-app.post('/spin', async (req, res) => {
-    const { initData, caseId, deviceId } = req.body;
+app.post('/commit', async (req, res) => {
+    const { initData, spinId, deviceId } = req.body;
 
     const user = verifyTelegram(initData);
     if (!user) return res.status(401).json({ error: 'Недействительная подпись' });
 
-    const caseNum = parseInt(caseId) || 1;
-    if (!CASES[caseNum]) return res.status(400).json({ error: 'Неизвестный кейс' });
-
     const userId = String(user.id);
-    const userRef = db.collection('users').doc(userId);
+
+    if (commitLock.has(userId)) {
+        return res.json({ ok: true, skipped: true });
+    }
+
     const pendingRef = db.collection('pending_spins').doc(userId);
-
-    const userDoc = await userRef.get();
-    if (userDoc.exists) {
-        const lastSpin = userDoc.data().lastSpin?.toDate?.();
-        const timeSince = lastSpin ? Date.now() - lastSpin.getTime() : Infinity;
-
-        const savedDevice = userDoc.data().deviceId;
-        if (savedDevice && savedDevice !== deviceId && timeSince < 5 * 60 * 1000) {
-            return res.status(403).json({ error: 'Рулетка уже открыта на другом устройстве!' });
-        }
-
-        if (timeSince < 5000) {
-            return res.status(429).json({ error: 'Слишком быстро!' });
-        }
-    }
-
-    let winner = null;
     const pendingDoc = await pendingRef.get();
-    if (pendingDoc.exists) {
-        const spins = pendingDoc.data().spins || [];
-        const idx = spins.findIndex(s => s.caseId === caseNum && !s.used);
-        if (idx !== -1) {
-            winner = { name: spins[idx].winner, power: spins[idx].power };
-            spins[idx].used = true;
-            await pendingRef.update({ spins });
+    if (!pendingDoc.exists) return res.status(400).json({ error: 'Нет заготовленных спинов' });
+
+    const spins = pendingDoc.data().spins || [];
+    const spinIdx = spins.findIndex(s => s.id === spinId && !s.used && !s.committed);
+    if (spinIdx === -1) return res.status(400).json({ error: 'Спин не найден или уже использован' });
+
+    const spin = spins[spinIdx];
+
+    spins[spinIdx] = { ...spin, committed: true };
+    await pendingRef.update({ spins });
+
+    commitLock.add(userId);
+
+    res.json({ ok: true, queued: true });
+
+    setTimeout(async () => {
+        try {
+            const userRef = db.collection('users').doc(userId);
+            await db.runTransaction(async (t) => {
+                const doc = await t.get(userRef);
+                const data = doc.exists ? doc.data() : {};
+                const itemCounts = data.itemCounts || {};
+                itemCounts[spin.winner] = (itemCounts[spin.winner] || 0) + 1;
+                const totalPower = (data.totalPower || 0) + spin.power;
+                t.set(userRef, {
+                    firstName: user.first_name || 'Игрок',
+                    username: user.username || null,
+                    photoUrl: user.photo_url || null,
+                    totalPower,
+                    itemCounts,
+                    lastSpin: admin.firestore.FieldValue.serverTimestamp(),
+                    deviceId: deviceId || null,
+                }, { merge: true });
+            });
+
+            const freshDoc = await pendingRef.get();
+            if (freshDoc.exists) {
+                const freshSpins = freshDoc.data().spins || [];
+                const idx = freshSpins.findIndex(s => s.id === spinId);
+                if (idx !== -1) { freshSpins[idx].used = true; await pendingRef.update({ spins: freshSpins }); }
+            }
+
+            console.log(`✅ committed user=${userId} winner=${spin.winner} power=${spin.power}`);
+        } catch (e) {
+            console.error('❌ commit error:', e);
+        } finally {
+            commitLock.delete(userId);
         }
-    }
-
-    if (!winner) {
-        winner = pickWinner(caseNum);
-    }
-
-    await db.runTransaction(async (t) => {
-        const doc = await t.get(userRef);
-        const existing = doc.exists ? doc.data() : {};
-        const itemCounts = existing.itemCounts || {};
-        itemCounts[winner.name] = (itemCounts[winner.name] || 0) + 1;
-        const totalPower = (existing.totalPower || 0) + winner.power;
-        t.set(userRef, {
-            firstName: user.first_name || 'Игрок',
-            username: user.username || null,
-            photoUrl: user.photo_url || null,
-            totalPower,
-            itemCounts,
-            lastSpin: admin.firestore.FieldValue.serverTimestamp(),
-            deviceId: deviceId || null,
-        }, { merge: true });
-    });
-
-    res.json({ winner: winner.name, power: winner.power });
+    }, COMMIT_DELAY_MS);
 });
 
-app.listen(process.env.PORT || 3000, () => console.log('Server running'));
+app.listen(process.env.PORT || 3000, () => console.log('✅ Server running'));
