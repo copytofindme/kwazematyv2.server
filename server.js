@@ -31,6 +31,9 @@ admin.initializeApp({
 const db = admin.firestore();
 const BOT_TOKEN = process.env.BOT_TOKEN;
 
+
+const CHALLENGE_SECRET = process.env.CHALLENGE_SECRET || crypto.randomBytes(32).toString('hex');
+
 const CASES = {
     1: [
         { name: "Amour plastique",  power: 1,   chance: 35  },
@@ -68,9 +71,13 @@ const SPIN_EXPIRY_MS = 30 * 60 * 1000;
 const commitLock = new Set();
 const lastCommitDone = new Map();
 const lastBatchRequest = new Map();
-const MIN_BETWEEN_COMMITS_MS = 6000;
+
+const MIN_BETWEEN_COMMITS_MS = 7500;
 const MIN_BETWEEN_BATCHES_MS = 20000;
-const MIN_SPIN_AGE_MS = 1000;
+const MIN_SPIN_AGE_MS = 7000;
+const CHALLENGE_MAX_MS = 60000;
+
+const MAX_SPINS_PER_DAY = 200;
 
 function pickWinner(caseId) {
     const items = CASES[caseId];
@@ -99,8 +106,36 @@ function verifyTelegram(initData) {
     } catch { return null; }
 }
 
-app.get('/health', (req, res) => res.json({ ok: true }));
+function makeChallenge(spinId, issuedAt) {
+    return crypto.createHmac('sha256', CHALLENGE_SECRET)
+        .update(`${spinId}:${issuedAt}`)
+        .digest('hex');
+}
 
+function verifyResponse(challenge, spinId, clientResponse) {
+    if (!clientResponse || typeof clientResponse !== 'string') return false;
+    const expected = crypto.createHmac('sha256', challenge)
+        .update(`${challenge}:${spinId}`)
+        .digest('hex');
+    try {
+        return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(clientResponse));
+    } catch { return false; }
+}
+
+async function getDailySpinCount(userId) {
+    const today = new Date().toISOString().slice(0, 10);
+    const ref = db.collection('daily_spins').doc(`${userId}_${today}`);
+    const doc = await ref.get();
+    return doc.exists ? (doc.data().count || 0) : 0;
+}
+
+async function incrementDailySpinCount(userId) {
+    const today = new Date().toISOString().slice(0, 10);
+    const ref = db.collection('daily_spins').doc(`${userId}_${today}`);
+    await ref.set({ count: admin.firestore.FieldValue.increment(1), userId, date: today }, { merge: true });
+}
+
+app.get('/health', (req, res) => res.json({ ok: true }));
 
 app.post('/batch', async (req, res) => {
     const { initData, caseId } = req.body;
@@ -115,12 +150,20 @@ app.post('/batch', async (req, res) => {
     const pendingRef = db.collection('pending_spins').doc(userId);
     const now = Date.now();
 
+    const dailyCount = await getDailySpinCount(userId);
+    if (dailyCount >= MAX_SPINS_PER_DAY) {
+        return res.status(429).json({ error: `Дневной лимит ${MAX_SPINS_PER_DAY} спинов исчерпан. Приходи завтра!` });
+    }
+
     const lastBatch = lastBatchRequest.get(userId) || 0;
     if (now - lastBatch < MIN_BETWEEN_BATCHES_MS) {
         const doc = await pendingRef.get();
         const existing = (doc.exists ? doc.data().spins || [] : [])
             .filter(s => s.caseId === caseNum && !s.used && !s.committed && (now - s.createdAt) < SPIN_EXPIRY_MS);
-        return res.json({ ok: true, spins: existing.map(s => ({ id: s.id, winner: s.winner, power: s.power })) });
+        return res.json({
+            ok: true,
+            spins: existing.map(s => ({ id: s.id, winner: s.winner, power: s.power, challenge: s.challenge, issuedAt: s.issuedAt }))
+        });
     }
     lastBatchRequest.set(userId, now);
 
@@ -132,14 +175,14 @@ app.post('/batch', async (req, res) => {
     const newSpins = [];
     for (let i = 0; i < toAdd; i++) {
         const w = pickWinner(caseNum);
+        const spinId = crypto.randomUUID();
+        const issuedAt = now;
+        const challenge = makeChallenge(spinId, issuedAt);
         newSpins.push({
-            id: crypto.randomUUID(),
-            caseId: caseNum,
-            winner: w.name,
-            power: w.power,
-            used: false,
-            committed: false,
-            createdAt: now,
+            id: spinId, caseId: caseNum,
+            winner: w.name, power: w.power,
+            used: false, committed: false,
+            createdAt: now, issuedAt, challenge,
         });
     }
 
@@ -148,21 +191,19 @@ app.post('/batch', async (req, res) => {
 
     res.json({
         ok: true,
-        spins: allSpins.map(s => ({ id: s.id, winner: s.winner, power: s.power }))
+        spins: allSpins.map(s => ({ id: s.id, winner: s.winner, power: s.power, challenge: s.challenge, issuedAt: s.issuedAt }))
     });
 });
 
 app.post('/commit', async (req, res) => {
-    const { initData, spinId, deviceId } = req.body;
+    const { initData, spinId, deviceId, cr } = req.body;
 
     const user = verifyTelegram(initData);
     if (!user) return res.status(401).json({ error: 'Недействительная подпись' });
 
     const userId = String(user.id);
 
-    if (commitLock.has(userId)) {
-        return res.json({ ok: true, skipped: true });
-    }
+    if (commitLock.has(userId)) return res.json({ ok: true, skipped: true });
 
     const lastDone = lastCommitDone.get(userId) || 0;
     const sinceLastCommit = Date.now() - lastDone;
@@ -180,16 +221,33 @@ app.post('/commit', async (req, res) => {
     if (spinIdx === -1) return res.status(400).json({ error: 'Спин не найден или уже использован' });
 
     const spin = spins[spinIdx];
+    const now = Date.now();
+    const spinAge = now - spin.createdAt;
 
-    if (Date.now() - spin.createdAt < MIN_SPIN_AGE_MS) {
-        return res.status(400).json({ error: 'Спин слишком свежий' });
+    if (spinAge < MIN_SPIN_AGE_MS) {
+        console.warn(`⚠️ bot_attempt user=${userId} spin_age=${spinAge}ms (too young)`);
+        return res.status(400).json({ error: 'Дождись конца анимации' });
+    }
+
+    if (spinAge > CHALLENGE_MAX_MS) {
+        return res.status(400).json({ error: 'Спин устарел, запроси новый' });
+    }
+
+
+    if (!verifyResponse(spin.challenge, spinId, cr)) {
+        console.warn(`⚠️ bot_attempt user=${userId} invalid_challenge_response`);
+        return res.status(403).json({ error: 'Ошибка верификации' });
+    }
+    
+    const dailyCount = await getDailySpinCount(userId);
+    if (dailyCount >= MAX_SPINS_PER_DAY) {
+        return res.status(429).json({ error: `Дневной лимит ${MAX_SPINS_PER_DAY} спинов исчерпан` });
     }
 
     spins[spinIdx] = { ...spin, committed: true };
     await pendingRef.update({ spins });
 
     commitLock.add(userId);
-
     res.json({ ok: true, queued: true });
 
     setTimeout(async () => {
@@ -205,12 +263,13 @@ app.post('/commit', async (req, res) => {
                     firstName: user.first_name || 'Игрок',
                     username: user.username || null,
                     photoUrl: user.photo_url || null,
-                    totalPower,
-                    itemCounts,
+                    totalPower, itemCounts,
                     lastSpin: admin.firestore.FieldValue.serverTimestamp(),
                     deviceId: deviceId || null,
                 }, { merge: true });
             });
+
+            await incrementDailySpinCount(userId);
 
             const freshDoc = await pendingRef.get();
             if (freshDoc.exists) {
@@ -219,7 +278,7 @@ app.post('/commit', async (req, res) => {
                 if (idx !== -1) { freshSpins[idx].used = true; await pendingRef.update({ spins: freshSpins }); }
             }
 
-            console.log(`✅ committed user=${userId} winner=${spin.winner} power=${spin.power}`);
+            console.log(`✅ committed user=${userId} winner=${spin.winner} power=${spin.power} daily=${dailyCount + 1}/${MAX_SPINS_PER_DAY}`);
             lastCommitDone.set(userId, Date.now());
         } catch (e) {
             console.error('❌ commit error:', e);
