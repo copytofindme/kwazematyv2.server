@@ -62,13 +62,13 @@ const CASES = {
 };
 
 const BATCH_SIZE = 10;
-const COMMIT_DELAY_MS = 7300;
+const COMMIT_DELAY_MS = 500;
 const SPIN_EXPIRY_MS = 30 * 60 * 1000;
 
 const commitLock = new Set();
 const lastCommitDone = new Map();
 const lastBatchRequest = new Map();
-const MIN_BETWEEN_COMMITS_MS = 8500;
+const MIN_BETWEEN_COMMITS_MS = 6000;
 const MIN_BETWEEN_BATCHES_MS = 20000;
 const MIN_SPIN_AGE_MS = 1000;
 
@@ -151,7 +151,6 @@ app.post('/batch', async (req, res) => {
         spins: allSpins.map(s => ({ id: s.id, winner: s.winner, power: s.power }))
     });
 });
-
 
 app.post('/commit', async (req, res) => {
     const { initData, spinId, deviceId } = req.body;
